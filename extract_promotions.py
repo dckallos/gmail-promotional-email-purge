@@ -1,4 +1,11 @@
+"""
+Fetches promotional emails concurrently with API rate limiting.
+Extracts metadata (Sender, Domain, Date, Subject) and saves to a CSV.
+"""
 import os
+import time
+import random
+import logging
 import threading
 import pandas as pd
 from email.utils import parseaddr
@@ -10,6 +17,9 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+# Configure thread-safe logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 # Load environment variables
 load_dotenv()
 
@@ -19,7 +29,6 @@ TOKEN_FILE = os.getenv('GMAIL_READONLY_TOKEN_FILE')
 OUTPUT_FILE = os.getenv('RAW_CSV_OUTPUT', 'promotions_to_review.csv')
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 
-# Thread-local storage to hold a separate API service object for each thread
 thread_local = threading.local()
 
 
@@ -37,12 +46,12 @@ class ProgressCounter:
         with self.lock:
             self.count += 1
             if self.count % 1000 == 0 or self.count == self.total:
-                print(f"Completed {self.count} out of {self.total} total emails retrieved...")
+                logging.info(f"Progress: Completed {self.count} out of {self.total} total emails retrieved.")
 
 
 def get_credentials():
     """
-    Handles OAuth 2.0 authentication and returns the credentials object.
+    Handles OAuth 2.0 authentication.
     """
     if not CREDENTIALS_FILE:
         raise ValueError("GMAIL_CREDENTIALS_FILE is not set in the .env file.")
@@ -61,7 +70,6 @@ def get_credentials():
         if TOKEN_FILE:
             with open(TOKEN_FILE, 'w') as token:
                 token.write(creds.to_json())
-
     return creds
 
 
@@ -76,7 +84,7 @@ def get_thread_local_service(creds):
 
 def get_header(headers: list, name: str) -> str:
     """
-    Extracts a specific header's value from the Gmail payload.
+    Extracts a specific header's value.
     """
     for header in headers:
         if header.get('name', '').lower() == name.lower():
@@ -97,50 +105,64 @@ def extract_domain(sender_string: str) -> str:
 def fetch_single_metadata(msg_id: str, creds, counter: ProgressCounter) -> dict:
     """
     Worker function to fetch metadata for a single email.
-
-    Uses thread-local service objects to remain thread-safe.
-    Updates the shared counter upon completion.
+    Implements a hard rate-limit ceiling and exponential backoff.
     """
     service = get_thread_local_service(creds)
-    try:
-        message_detail = service.users().messages().get(
-            userId='me',
-            id=msg_id,
-            format='metadata',
-            metadataHeaders=['From', 'Subject', 'Date']
-        ).execute()
+    max_retries = 5
+    base_delay = 1
 
-        headers = message_detail.get('payload', {}).get('headers', [])
-        sender = get_header(headers, 'From')
+    for attempt in range(max_retries):
+        try:
+            # HARD CEILING: 10 threads sleeping 0.3s ensures max ~2000 queries/min
+            time.sleep(0.3)
 
-        result = {
-            'Message_ID': msg_id,
-            'Date': get_header(headers, 'Date'),
-            'Sender': sender,
-            'Domain': extract_domain(sender),
-            'Subject': get_header(headers, 'Subject')
-        }
-    except Exception as e:
-        # If one API call fails, log it but don't crash the thread
-        print(f"\nError fetching {msg_id}: {e}")
-        result = None
-    finally:
-        counter.increment()
+            message_detail = service.users().messages().get(
+                userId='me',
+                id=msg_id,
+                format='metadata',
+                metadataHeaders=['From', 'Subject', 'Date']
+            ).execute()
 
-    return result
+            headers = message_detail.get('payload', {}).get('headers', [])
+            sender = get_header(headers, 'From')
+
+            result = {
+                'Message_ID': msg_id,
+                'Date': get_header(headers, 'Date'),
+                'Sender': sender,
+                'Domain': extract_domain(sender),
+                'Subject': get_header(headers, 'Subject')
+            }
+            counter.increment()
+            return result
+
+        except HttpError as error:
+            # Catch Rate Limits (403 or 429) and apply exponential backoff
+            if error.resp.status in [403, 429] and attempt < max_retries - 1:
+                sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 1)
+                logging.warning(f"Rate limit hit for {msg_id}. Backing off for {sleep_time:.2f}s...")
+                time.sleep(sleep_time)
+                continue
+
+            logging.error(f"Failed to fetch {msg_id} after retries: {error}")
+            counter.increment()
+            return None
+        except Exception as e:
+            logging.error(f"Unexpected error fetching {msg_id}: {e}")
+            counter.increment()
+            return None
+
+    counter.increment()
+    return None
 
 
 def extract_promotions(creds) -> list[dict]:
     """
-    Fetches promotional emails concurrently and returns a list of dictionaries.
-
-    Phase 1: Sequentially fetches all message IDs (500 per page).
-    Phase 2: Concurrently fetches the metadata for all IDs using a ThreadPoolExecutor.
+    Fetches all promotional email IDs, then concurrently extracts their metadata.
     """
     service = get_thread_local_service(creds)
-    message_ids = []
 
-    print("Phase 1: Fetching list of all promotional email IDs...")
+    logging.info("Phase 1: Fetching list of all promotional email IDs...")
     try:
         results = service.users().messages().list(userId='me', q='category:promotions', maxResults=500).execute()
         messages = results.get('messages', [])
@@ -156,17 +178,15 @@ def extract_promotions(creds) -> list[dict]:
 
         message_ids = [msg.get('id') for msg in messages if msg.get('id')]
         total_emails = len(message_ids)
-        print(f"Found {total_emails} emails. Moving to Phase 2...")
+        logging.info(f"Found {total_emails} emails. Moving to Phase 2 (Concurrent Extraction)...")
 
     except HttpError as error:
-        print(f'An API error occurred during ID extraction: {error}')
+        logging.error(f"An API error occurred during ID extraction: {error}")
         return []
 
-    print("\nPhase 2: Concurrently fetching metadata...")
     emails_data = []
     counter = ProgressCounter(total_emails)
 
-    # max_workers=10 is a safe threshold to avoid hitting the Gmail API 250 requests/sec limit
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(fetch_single_metadata, msg_id, creds, counter): msg_id for msg_id in message_ids}
 
@@ -186,9 +206,8 @@ if __name__ == '__main__':
         if data:
             df = pd.DataFrame(data)
             df.to_csv(OUTPUT_FILE, index=False)
-            print(f"\nExtraction complete! Saved {len(data)} rows to '{OUTPUT_FILE}'.")
-            print("Please review the CSV, delete the rows you want to KEEP, and save as the approved input file.")
+            logging.info(f"Extraction complete! Saved {len(data)} rows to '{OUTPUT_FILE}'.")
         else:
-            print("No promotional emails found.")
+            logging.info("No promotional emails found.")
     except Exception as e:
-        print(f"A critical error occurred: {e}")
+        logging.critical(f"A critical error occurred: {e}")
