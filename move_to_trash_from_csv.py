@@ -8,6 +8,7 @@ import time
 import random
 import logging
 import threading
+import socket
 import pandas as pd
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,6 +17,9 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+
+# Set a global timeout to prevent infinite network hangs
+socket.setdefaulttimeout(120)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 load_dotenv()
@@ -94,20 +98,24 @@ def get_thread_local_service(creds):
 
 def fallback_trash_single(chunk: list[str], creds, tracker: StateTracker) -> None:
     """
-    Fallback function: Processes a failed batch 1-by-1 to isolate bad IDs
-    and successfully trash the remaining valid emails.
+    Fallback function: Processes a failed batch 1-by-1 to isolate bad IDs.
+    Now includes a heartbeat log for visibility.
     """
     service = get_thread_local_service(creds)
-    logging.warning(f"Fallback triggered: Processing {len(chunk)} emails individually to isolate bad IDs...")
+    total_in_chunk = len(chunk)
+    logging.warning(f"Fallback triggered: Processing {total_in_chunk} emails individually to isolate bad IDs...")
 
     successful_ids = []
     max_retries = 3
     base_delay = 1
 
-    for msg_id in chunk:
+    for index, msg_id in enumerate(chunk, start=1):
+        # HEARTBEAT LOG: Print progress every 100 emails so it doesn't look frozen
+        if index % 100 == 0:
+            logging.info(f"Fallback progress: Checked {index} out of {total_in_chunk} emails in this batch...")
+
         for attempt in range(max_retries):
             try:
-                # Gentle throttle to prevent rate-limiting on individual requests
                 time.sleep(0.1)
                 service.users().messages().batchModify(
                     userId='me',
@@ -119,12 +127,12 @@ def fallback_trash_single(chunk: list[str], creds, tracker: StateTracker) -> Non
                 ).execute()
 
                 successful_ids.append(msg_id)
-                break  # Success, move to the next msg_id
+                break
 
             except HttpError as error:
                 if error.resp.status == 400:
                     logging.warning(f"Identified and skipped invalid ID during fallback: {msg_id}")
-                    break  # Skip this bad ID, do not retry
+                    break
 
                 if error.resp.status in [403, 429, 500, 502, 503] and attempt < max_retries - 1:
                     sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 1)
@@ -133,8 +141,11 @@ def fallback_trash_single(chunk: list[str], creds, tracker: StateTracker) -> Non
 
                 logging.error(f"Failed to trash ID {msg_id} after retries: {error}")
                 break
+            except Exception as e:
+                # Catch network timeouts so the thread doesn't crash silently
+                logging.error(f"Network or timeout error on ID {msg_id}: {e}")
+                break
 
-    # Bulk-log the successful ones to prevent spamming the terminal
     if successful_ids:
         tracker.mark_success(successful_ids)
         logging.info(
