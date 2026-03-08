@@ -100,7 +100,7 @@ def trash_batch(chunk: list[str], creds, tracker: StateTracker) -> None:
             break  # Exit retry loop
 
         except HttpError as error:
-            if error.resp.status in [403, 429] and attempt < max_retries - 1:
+            if error.resp.status in [403, 429, 500, 502, 503] and attempt < max_retries - 1:
                 sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 1)
                 logging.warning(f"Rate limit hit on batch. Backing off for {sleep_time:.2f}s...")
                 time.sleep(sleep_time)
