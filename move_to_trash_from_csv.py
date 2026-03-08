@@ -87,7 +87,6 @@ def get_thread_local_service(creds):
     Retrieves or builds a thread-specific Gmail API service.
     """
     if not hasattr(thread_local, "service"):
-        # Added cache_discovery=False to silence the annoying oauth2client warning
         # cache_discovery=False silences the annoying oauth2client warning
         thread_local.service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
     return thread_local.service
