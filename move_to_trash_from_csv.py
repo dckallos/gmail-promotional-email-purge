@@ -1,6 +1,7 @@
 """
 Reads approved email IDs from a CSV and moves them to the Gmail Trash.
-Processes in concurrent batches with data sanitization and state tracking.
+Processes in concurrent batches with data sanitization, state tracking,
+and a 1-by-1 fallback mechanism for batches containing invalid IDs.
 """
 import os
 import time
@@ -45,6 +46,9 @@ class StateTracker:
         """
         Records the successful batch to disk and increments the progress.
         """
+        if not chunk:
+            return
+
         with self.lock:
             with open(self.log_file, 'a') as f:
                 for msg_id in chunk:
@@ -84,8 +88,58 @@ def get_thread_local_service(creds):
     """
     if not hasattr(thread_local, "service"):
         # Added cache_discovery=False to silence the annoying oauth2client warning
+        # cache_discovery=False silences the annoying oauth2client warning
         thread_local.service = build('gmail', 'v1', credentials=creds, cache_discovery=False)
     return thread_local.service
+
+
+def fallback_trash_single(chunk: list[str], creds, tracker: StateTracker) -> None:
+    """
+    Fallback function: Processes a failed batch 1-by-1 to isolate bad IDs
+    and successfully trash the remaining valid emails.
+    """
+    service = get_thread_local_service(creds)
+    logging.warning(f"Fallback triggered: Processing {len(chunk)} emails individually to isolate bad IDs...")
+
+    successful_ids = []
+    max_retries = 3
+    base_delay = 1
+
+    for msg_id in chunk:
+        for attempt in range(max_retries):
+            try:
+                # Gentle throttle to prevent rate-limiting on individual requests
+                time.sleep(0.1)
+                service.users().messages().batchModify(
+                    userId='me',
+                    body={
+                        'ids': [msg_id],
+                        'addLabelIds': ['TRASH'],
+                        'removeLabelIds': []
+                    }
+                ).execute()
+
+                successful_ids.append(msg_id)
+                break  # Success, move to the next msg_id
+
+            except HttpError as error:
+                if error.resp.status == 400:
+                    logging.warning(f"Identified and skipped invalid ID during fallback: {msg_id}")
+                    break  # Skip this bad ID, do not retry
+
+                if error.resp.status in [403, 429, 500, 502, 503] and attempt < max_retries - 1:
+                    sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 1)
+                    time.sleep(sleep_time)
+                    continue
+
+                logging.error(f"Failed to trash ID {msg_id} after retries: {error}")
+                break
+
+    # Bulk-log the successful ones to prevent spamming the terminal
+    if successful_ids:
+        tracker.mark_success(successful_ids)
+        logging.info(
+            f"Fallback complete: Rescued and trashed {len(successful_ids)} valid emails from the failed batch.")
 
 
 def trash_batch(chunk: list[str], creds, tracker: StateTracker) -> None:
@@ -114,13 +168,13 @@ def trash_batch(chunk: list[str], creds, tracker: StateTracker) -> None:
             break  # Exit retry loop
 
         except HttpError as error:
-            # Handle 400 errors specifically (bad data, do not retry)
+            # Handle 400 errors specifically by triggering the 1-by-1 fallback
             if error.resp.status == 400:
-                logging.error(
-                    "400 Precondition Failed: This batch likely contains an already-purged ID. Skipping batch.")
+                logging.warning("400 Precondition Failed: Batch contains an invalid ID. Initiating 1-by-1 fallback...")
+                fallback_trash_single(chunk, creds, tracker)
                 break
 
-            # Handle rate limits and server errors (safe to retry)
+            # Handle rate limits and server errors (safe to retry the bulk batch)
             if error.resp.status in [403, 429, 500, 502, 503] and attempt < max_retries - 1:
                 sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 1)
                 logging.warning(f"Rate limit or server glitch hit. Backing off for {sleep_time:.2f}s...")
