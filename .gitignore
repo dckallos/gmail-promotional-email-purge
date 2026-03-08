@@ -1,3 +1,8 @@
 /.idea
 credentials.json
 token_readonly.json
+.Rproj.user
+approved_to_trash.csv
+promotions_to_review.csv
+token_modify.json
+trashed_success.log
