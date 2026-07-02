@@ -35,7 +35,7 @@ I built this tool because I wanted to review the emails I was about to delete ra
 Clone this repository and install the required dependencies:
 
 ```bash
-git clone [https://github.com/yourusername/gmail-promotions-cleaner.git](https://github.com/yourusername/gmail-promotions-cleaner.git)
+git clone https://github.com/yourusername/gmail-promotions-cleaner.git
 cd gmail-promotions-cleaner
 
 # Install required Python packages
